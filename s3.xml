@@ -1,0 +1,12 @@
+<?xml version="1.0"?>
+<!-- The COPYRIGHT file at the top level of this repository contains the full
+     copyright notices and license terms. -->
+<tryton>
+    <data>
+        <record model="ir.cron" id="cron_sync_s3_filestore_cache">
+            <field name="interval_number" eval="1"/>
+            <field name="interval_type">hours</field>
+            <field name="method">ir.cron|sync_s3_filestore_cache</field>
+        </record>
+    </data>
+</tryton>
