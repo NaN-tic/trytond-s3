@@ -503,5 +503,22 @@ class S3TestCase(ModuleTestCase):
         ensure_uploaded.assert_called_once_with(Transaction().database.name)
         self.assertTrue(cron.active)
 
+    @with_transaction()
+    def test_cron_sync_s3_filestore_cache_deactivates_on_run_once(self):
+        Cron = Pool().get('ir.cron')
+        cron = self._create_sync_cron(Cron)
+
+        self.assertTrue(cron.active)
+
+        with patch.object(
+                s3.FileStoreS3, 'ensure_uploaded',
+                return_value={'scanned': 1, 'uploaded': 1, 'skipped': 0}
+                ) as ensure_uploaded:
+            Cron.run_once([cron])
+
+        ensure_uploaded.assert_called_once_with(Transaction().database.name)
+        cron = Cron(cron.id)
+        self.assertFalse(cron.active)
+
 
 del ModuleTestCase
