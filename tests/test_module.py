@@ -488,7 +488,7 @@ class S3TestCase(ModuleTestCase):
         self.assertFalse(cron.active)
 
     @with_transaction()
-    def test_cron_sync_s3_filestore_cache_keeps_active_on_manual_run(self):
+    def test_cron_sync_s3_filestore_cache_deactivates_on_manual_run(self):
         Cron = Pool().get('ir.cron')
         cron = self._create_sync_cron(Cron)
 
@@ -501,7 +501,8 @@ class S3TestCase(ModuleTestCase):
             Cron.sync_s3_filestore_cache()
 
         ensure_uploaded.assert_called_once_with(Transaction().database.name)
-        self.assertTrue(cron.active)
+        cron = Cron(cron.id)
+        self.assertFalse(cron.active)
 
     @with_transaction()
     def test_cron_sync_s3_filestore_cache_deactivates_on_run_once(self):
