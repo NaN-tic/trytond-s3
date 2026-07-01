@@ -4,6 +4,8 @@ import gzip
 import hashlib
 import logging
 import os
+import queue
+import threading
 import time
 from functools import cache
 from io import BytesIO
@@ -32,6 +34,7 @@ max_file_life_cache = config.getint(
     'database', 'max_file_life_cache', default=-1)
 max_file_life_count = config.getint(
     'database', 'max_file_life_count', default=-1)
+s3_workers = config.getint('database', 's3_workers', default=50)
 
 
 def get_default_storage_class():
@@ -133,6 +136,25 @@ def is_not_found_error(exception):
     return error.get('Code') in {'404', 'NoSuchKey', 'NotFound'}
 
 
+class ProcessClock:
+
+    def __init__(self):
+        self.started_at = time.monotonic()
+        self.last_at = self.started_at
+        self.lock = threading.Lock()
+
+    def format(self, message):
+        now = time.monotonic()
+        timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
+        with self.lock:
+            elapsed_since_last = now - self.last_at
+            elapsed_since_start = now - self.started_at
+            self.last_at = now
+        return (
+            '[%s] [last=%.3fs] [total=%.3fs] %s'
+            % (timestamp, elapsed_since_last, elapsed_since_start, message))
+
+
 class Cron(metaclass=PoolMeta):
     __name__ = 'ir.cron'
 
@@ -145,8 +167,11 @@ class Cron(metaclass=PoolMeta):
 
     @classmethod
     def sync_s3_filestore_cache(cls):
+        process_clock = ProcessClock()
         result = FileStoreS3().ensure_uploaded(Transaction().database.name)
-        logger.info('S3 cache synchronization result: %s', result)
+        logger.info(
+            process_clock.format('S3 cache synchronization result: %s'),
+            result)
 
         crons = cls.search([
             ('method', '=', 'ir.cron|sync_s3_filestore_cache'),
@@ -235,6 +260,7 @@ class FileStoreS3(FileStore):
         return removed
 
     def get(self, file_id, prefix=''):
+        process_clock = ProcessClock()
         filename = self._filename(file_id, prefix)
         cache_file = check_cache(filename)
         if cache_file is not None:
@@ -244,7 +270,7 @@ class FileStoreS3(FileStore):
                 removed_files = self.prune_cache_files()
                 if removed_files:
                     logger.info(
-                        'Removed %d cache files: %s',
+                        process_clock.format('Removed %d cache files: %s'),
                         len(removed_files),
                         ', '.join(removed_files))
 
@@ -305,42 +331,87 @@ class FileStoreS3(FileStore):
                 'encrypted': 0,
                 'skipped': 0,
             }
+        process_clock = ProcessClock()
+        task_queue = queue.Queue(maxsize=max(s3_workers * 2, 1))
+        stop_event = threading.Event()
+        lock = threading.Lock()
+        sentinel = object()
+        counters = {'scanned': 0, 'encrypted': 0, 'skipped': 0}
+        errors = []
 
-        encrypted_count = 0
-        skipped_count = 0
-        scanned_count = 0
-        for key in self.list(prefix):
-            scanned_count += 1
-            try:
-                response = self.client.get_object(bucket, key)
+        def worker():
+            while True:
+                key = task_queue.get()
                 try:
-                    data = response.read()
+                    if key is sentinel:
+                        return
+                    response = self.client.get_object(bucket, key)
                     try:
-                        decrypt(data)
-                    except InvalidToken:
-                        self._put_s3_data(key, data)
-                        encrypted_count += 1
-                    else:
-                        skipped_count += 1
+                        data = response.read()
+                        try:
+                            decrypt(data)
+                        except InvalidToken:
+                            self._put_s3_data(key, data)
+                            outcome = 'encrypted'
+                        else:
+                            outcome = 'skipped'
+                    finally:
+                        response.close()
+                        response.release_conn()
+                    with lock:
+                        counters[outcome] += 1
+                except Exception as exc:
+                    with lock:
+                        errors.append(exc)
+                    stop_event.set()
                 finally:
-                    response.close()
-                    response.release_conn()
-            except S3Error:
-                raise
-            if scanned_count % 100 == 0:
-                logger.info(
-                    'S3 ensure encrypted progress: scanned=%d uploaded=%d '
-                    'skipped=%d',
-                    scanned_count, encrypted_count, skipped_count)
+                    task_queue.task_done()
 
-        logger.info(
-            'S3 ensure encrypted result: scanned=%d uploaded=%d skipped=%d',
-            scanned_count, encrypted_count, skipped_count)
-        return {
-            'scanned': scanned_count,
-            'encrypted': encrypted_count,
-            'skipped': skipped_count,
-        }
+        workers = [
+            threading.Thread(target=worker, daemon=True)
+            for _ in range(max(s3_workers, 1))
+            ]
+        for thread in workers:
+            thread.start()
+
+        try:
+            for key in self.list(prefix):
+                if stop_event.is_set():
+                    break
+                with lock:
+                    counters['scanned'] += 1
+                    scanned = counters['scanned']
+                task_queue.put(key)
+                if scanned % 100 == 0:
+                    with lock:
+                        message = process_clock.format(
+                            'S3 ensure encrypted progress: scanned=%d '
+                            'encrypted=%d skipped=%d') % (
+                                counters['scanned'],
+                                counters['encrypted'],
+                                counters['skipped'])
+                        logger.info(message)
+                        print(message)
+            if errors:
+                raise errors[0]
+            task_queue.join()
+            if errors:
+                raise errors[0]
+        finally:
+            for _ in workers:
+                task_queue.put(sentinel)
+            for thread in workers:
+                thread.join()
+
+        message = process_clock.format(
+            'S3 ensure encrypted result: scanned=%d encrypted=%d skipped=%d'
+            ) % (
+                counters['scanned'],
+                counters['encrypted'],
+                counters['skipped'])
+        logger.info(message)
+        print(message)
+        return counters
 
     def ensure_uploaded(self, prefix=''):
         if not PRODUCTION_ENV:
@@ -349,41 +420,82 @@ class FileStoreS3(FileStore):
                 'uploaded': 0,
                 'skipped': 0,
             }
+        process_clock = ProcessClock()
+        task_queue = queue.Queue(maxsize=max(s3_workers * 2, 1))
+        stop_event = threading.Event()
+        lock = threading.Lock()
+        sentinel = object()
+        counters = {'scanned': 0, 'uploaded': 0, 'skipped': 0}
+        errors = []
 
-        scanned_count = 0
-        uploaded_count = 0
-        skipped_count = 0
-        for file_id, filename in local_files(self.path, prefix):
-            scanned_count += 1
-            key = name(file_id, prefix)
-            try:
-                self._stat_s3_data(key)
-            except S3Error as exc:
-                if not is_not_found_error(exc):
-                    raise
-                with open(filename, 'rb') as local_file:
-                    data = local_file.read()
-                self._put_s3_data(key, data)
-                uploaded_count += 1
-            else:
-                skipped_count += 1
+        def worker():
+            while True:
+                file_info = task_queue.get()
+                try:
+                    if file_info is sentinel:
+                        return
+                    file_id, filename = file_info
+                    key = name(file_id, prefix)
+                    try:
+                        self._stat_s3_data(key)
+                    except S3Error as exc:
+                        if not is_not_found_error(exc):
+                            raise
+                        with open(filename, 'rb') as local_file:
+                            data = local_file.read()
+                        self._put_s3_data(key, data)
+                        outcome = 'uploaded'
+                    else:
+                        outcome = 'skipped'
+                    with lock:
+                        counters[outcome] += 1
+                except Exception as exc:
+                    with lock:
+                        errors.append(exc)
+                    stop_event.set()
+                finally:
+                    task_queue.task_done()
 
-            if scanned_count % 100 == 0:
-                logger.info(
-                    'S3 cache upload progress: scanned=%d uploaded=%d '
-                    'skipped=%d',
-                    scanned_count, uploaded_count, skipped_count)
-                break
+        workers = [
+            threading.Thread(target=worker, daemon=True)
+            for _ in range(max(s3_workers, 1))
+            ]
+        for thread in workers:
+            thread.start()
 
-        logger.info(
-            'S3 cache upload result: scanned=%d uploaded=%d skipped=%d',
-            scanned_count, uploaded_count, skipped_count)
+        try:
+            for file_info in local_files(self.path, prefix):
+                if stop_event.is_set():
+                    break
+                with lock:
+                    counters['scanned'] += 1
+                    scanned = counters['scanned']
+                task_queue.put(file_info)
+                if scanned % 100 == 0:
+                    with lock:
+                        logger.info(process_clock.format(
+                            'S3 cache upload progress: scanned=%d '
+                            'uploaded=%d skipped=%d') % (
+                                counters['scanned'],
+                                counters['uploaded'],
+                                counters['skipped']))
+            if errors:
+                raise errors[0]
+            task_queue.join()
+            if errors:
+                raise errors[0]
+        finally:
+            for _ in workers:
+                task_queue.put(sentinel)
+            for thread in workers:
+                thread.join()
 
-        return {
-            'scanned': scanned_count,
-            'uploaded': uploaded_count,
-            'skipped': skipped_count,
-        }
+        logger.info(process_clock.format(
+            'S3 cache upload result: scanned=%d uploaded=%d skipped=%d') % (
+                counters['scanned'],
+                counters['uploaded'],
+                counters['skipped']))
+        return counters
 
     def delete(self, file_id, prefix=''):
         filename = self._filename(file_id, prefix)
