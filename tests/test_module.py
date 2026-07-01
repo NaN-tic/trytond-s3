@@ -3,6 +3,7 @@
 import datetime
 import os
 import tempfile
+import threading
 from types import SimpleNamespace
 from unittest.mock import PropertyMock, patch
 
@@ -417,6 +418,39 @@ class S3TestCase(ModuleTestCase):
             s3.decompress(fernet.decrypt(client.put_calls[0][2].getvalue())),
             plain_body)
 
+    def test_s3_filestore_ensure_encrypted_uses_multiple_threads(self):
+        filestore = s3.FileStoreS3()
+        fernet = Fernet('8BwFmKMykS2X2-gmwEwgfmA9hPN-pb4Ua5N2XyqAlh4=')
+        barrier = threading.Barrier(2)
+        thread_ids = set()
+
+        class Client:
+            def get_object(self, bucket, key):
+                thread_ids.add(threading.get_ident())
+                barrier.wait(timeout=1)
+                return FakeObjectResponse(b'plain')
+
+            def put_object(self, *args):
+                return None
+
+        with patch.object(s3, 'PRODUCTION_ENV', True), \
+                patch.object(s3, 's3_workers', 2), \
+                patch.object(
+                    s3.FileStoreS3, 'client',
+                    new_callable=PropertyMock, return_value=Client()), \
+                patch.object(
+                    s3.FileStoreS3, 'list',
+                    return_value=iter(['prefix/first', 'prefix/second'])), \
+                patch.object(s3, 'get_fernet_key', return_value=fernet):
+            result = filestore.ensure_encrypted('prefix')
+
+        self.assertEqual(result, {
+                'scanned': 2,
+                'encrypted': 2,
+                'skipped': 0,
+                })
+        self.assertEqual(len(thread_ids), 2)
+
     def test_s3_filestore_ensure_uploaded(self):
         filestore = s3.FileStoreS3()
         fernet = Fernet('8BwFmKMykS2X2-gmwEwgfmA9hPN-pb4Ua5N2XyqAlh4=')
@@ -468,6 +502,31 @@ class S3TestCase(ModuleTestCase):
         self.assertEqual(
             s3.decompress(fernet.decrypt(client.put_calls[0][2].getvalue())),
             b'missing')
+
+    def test_s3_filestore_ensure_uploaded_processes_more_than_100_files(self):
+        filestore = s3.FileStoreS3()
+        local_entries = [
+            (f'file-{index:03d}', f'/tmp/file-{index:03d}')
+            for index in range(101)
+            ]
+
+        class Client:
+            def stat_object(self, bucket, key):
+                return SimpleNamespace(size=1)
+
+        with patch.object(s3, 'PRODUCTION_ENV', True), \
+                patch.object(s3, 's3_workers', 2), \
+                patch.object(
+                    s3.FileStoreS3, 'client',
+                    new_callable=PropertyMock, return_value=Client()), \
+                patch.object(s3, 'local_files', return_value=iter(local_entries)):
+            result = filestore.ensure_uploaded('attachments')
+
+        self.assertEqual(result, {
+                'scanned': 101,
+                'uploaded': 0,
+                'skipped': 101,
+                })
 
     @with_transaction()
     def test_cron_sync_s3_filestore_cache_deactivates_after_execution(self):
