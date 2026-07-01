@@ -148,15 +148,12 @@ class Cron(metaclass=PoolMeta):
         result = FileStoreS3().ensure_uploaded(Transaction().database.name)
         logger.info('S3 cache synchronization result: %s', result)
 
-        if (Transaction().user == 0
-                or Transaction().context.get('_cron')
-                == 'ir.cron|sync_s3_filestore_cache'):
-            crons = cls.search([
-                ('method', '=', 'ir.cron|sync_s3_filestore_cache'),
-                ('active', '=', True),
-            ])
-            if crons:
-                cls.write(crons, {'active': False})
+        crons = cls.search([
+            ('method', '=', 'ir.cron|sync_s3_filestore_cache'),
+            ('active', '=', True),
+        ])
+        if crons:
+            cls.write(crons, {'active': False})
 
 
 class FileStoreS3(FileStore):
