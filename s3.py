@@ -1,7 +1,6 @@
 # The COPYRIGHT file at the top level of this repository contains the full
 # copyright notices and license terms.
 import gzip
-import hashlib
 import logging
 import os
 import queue
@@ -220,9 +219,6 @@ class FileStoreS3(FileStore):
     def _delete_s3_data(self, key):
         self.client.remove_object(bucket, key)
 
-    def _id(self, data):
-        return hashlib.md5(data).hexdigest()
-
     def prune_cache_files(self):
         cache_files = []
         if os.path.isdir(self.path):
@@ -288,36 +284,15 @@ class FileStoreS3(FileStore):
         return self._stat_s3_data(key).size
 
     def set(self, data, prefix=''):
-        file_id = self._id(data)
-        filename = self._filename(file_id, prefix)
-        os.makedirs(os.path.dirname(filename), mode=0o770, exist_ok=True)
-        collision = 0
-        while True:
-            basename = os.path.basename(filename)
-            if PRODUCTION_ENV:
-                try:
-                    if data != self._get_s3_data(basename, prefix):
-                        collision += 1
-                        filename = self._filename(
-                            '%s-%s' % (file_id, collision), prefix)
-                        continue
-                except S3Error as exc:
-                    if not is_not_found_error(exc):
-                        raise
-                    key = name(basename, prefix)
-                    self._put_s3_data(key, data)
-                    save_cache(data, filename)
-                else:
-                    save_cache(data, filename)
-            elif os.path.exists(filename):
-                if data != check_cache(filename):
-                    collision += 1
-                    filename = self._filename(
-                        '%s-%s' % (file_id, collision), prefix)
-                    continue
-            else:
-                save_cache(data, filename)
-            return basename
+        file_id = super().set(data, prefix)
+        if not PRODUCTION_ENV:
+            return file_id
+        try:
+            self._put_s3_data(name(file_id, prefix), data)
+        except Exception:
+            super().delete(file_id, prefix)
+            raise
+        return file_id
 
     def list(self, prefix=''):
         for obj in self.client.list_objects(
@@ -498,9 +473,7 @@ class FileStoreS3(FileStore):
         return counters
 
     def delete(self, file_id, prefix=''):
-        filename = self._filename(file_id, prefix)
-        if os.path.exists(filename):
-            os.remove(filename)
+        super().delete(file_id, prefix)
         if not PRODUCTION_ENV:
             return
         key = name(file_id, prefix)
