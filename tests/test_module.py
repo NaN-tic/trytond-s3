@@ -226,19 +226,24 @@ class S3TestCase(ModuleTestCase):
         filestore = s3.FileStoreS3()
 
         class Client:
-            def put_object(self, **kwargs):
+            def put_object(self, *args):
                 return None
 
-        with patch.object(s3, 'PRODUCTION_ENV', True), \
-                patch.object(s3, 'get_fernet_key', return_value=None), \
-                patch.object(
-                    s3.FileStoreS3, '_get_s3_data',
-                    side_effect=FakeS3Error('404')), \
-                patch.object(
-                    s3.FileStoreS3, 'client',
-                    new_callable=PropertyMock, return_value=Client()):
-            with self.assertRaises(UserError):
-                filestore.set(b'data', 'attachments')
+        with tempfile.TemporaryDirectory() as tmpdir:
+            attachments = os.path.join(tmpdir, 'attachments')
+            with patch.object(s3, 'PRODUCTION_ENV', True), \
+                    patch.object(s3, 'get_fernet_key', return_value=None), \
+                    patch.object(
+                        s3.FileStoreS3, 'path',
+                        new_callable=PropertyMock, return_value=tmpdir), \
+                    patch.object(
+                        s3.FileStoreS3, 'client',
+                        new_callable=PropertyMock, return_value=Client()):
+                with self.assertRaises(UserError):
+                    filestore.set(b'data', 'attachments')
+            self.assertEqual(
+                sum(len(filenames) for _, _, filenames in os.walk(attachments)),
+                0)
 
     def test_s3_filestore_production_set_saves_local_cache(self):
         filestore = s3.FileStoreS3()
@@ -268,6 +273,7 @@ class S3TestCase(ModuleTestCase):
                             '8BwFmKMykS2X2-gmwEwgfmA9hPN-pb4Ua5N2XyqAlh4=')):
                 file_id = filestore.set(b'payload', 'attachments')
                 filename = filestore._filename(file_id, 'attachments')
+                self.assertIn('-', file_id)
                 self.assertTrue(os.path.exists(filename))
                 with open(filename, 'rb') as cache_file:
                     self.assertEqual(cache_file.read(), b'payload')
@@ -300,7 +306,7 @@ class S3TestCase(ModuleTestCase):
 
         self.assertEqual(size, len(b'cached-size'))
 
-    def test_s3_filestore_production_set_reuses_existing_content(self):
+    def test_s3_filestore_production_set_uses_core_uuid_ids(self):
         filestore = s3.FileStoreS3()
         payload = b'same-data'
 
@@ -313,10 +319,6 @@ class S3TestCase(ModuleTestCase):
 
         client = Client()
         with tempfile.TemporaryDirectory() as tmpdir:
-            expected_id = filestore._id(payload)
-            filename = os.path.join(
-                tmpdir, 'attachments', expected_id[0:2], expected_id[2:4],
-                expected_id)
             with patch.object(s3, 'PRODUCTION_ENV', True), \
                     patch.object(
                         s3.FileStoreS3, 'path',
@@ -325,55 +327,65 @@ class S3TestCase(ModuleTestCase):
                         s3.FileStoreS3, 'client',
                         new_callable=PropertyMock, return_value=client), \
                     patch.object(
-                        s3.FileStoreS3, '_get_s3_data',
-                        return_value=payload) as get_s3_mock:
-                file_id = filestore.set(payload, 'attachments')
-                self.assertTrue(os.path.exists(filename))
+                        s3, 'get_fernet_key',
+                        return_value=Fernet(
+                            '8BwFmKMykS2X2-gmwEwgfmA9hPN-pb4Ua5N2XyqAlh4=')):
+                first_id = filestore.set(payload, 'attachments')
+                second_id = filestore.set(payload, 'attachments')
 
-        self.assertEqual(file_id, expected_id)
-        self.assertEqual(get_s3_mock.call_count, 1)
-        self.assertEqual(client.put_calls, [])
+                self.assertNotEqual(first_id, second_id)
+                self.assertIn('-', first_id)
+                self.assertIn('-', second_id)
+                self.assertTrue(os.path.exists(
+                    filestore._filename(first_id, 'attachments')))
+                self.assertTrue(os.path.exists(
+                    filestore._filename(second_id, 'attachments')))
 
-    def test_s3_filestore_production_set_uses_s3_as_source_of_truth(self):
+        self.assertEqual(len(client.put_calls), 2)
+
+    def test_s3_filestore_delete_keeps_legacy_ids_without_dash(self):
         filestore = s3.FileStoreS3()
-        payload = b'same-data'
+        file_id = 'abcd1234'
 
-        class Client:
-            def __init__(self):
-                self.put_calls = []
-
-            def put_object(self, *args):
-                self.put_calls.append(args)
-
-        client = Client()
         with tempfile.TemporaryDirectory() as tmpdir:
-            expected_id = filestore._id(payload)
             filename = os.path.join(
-                tmpdir, 'attachments', expected_id[0:2], expected_id[2:4],
-                expected_id)
+                tmpdir, 'attachments', file_id[0:2], file_id[2:4], file_id)
             os.makedirs(os.path.dirname(filename), exist_ok=True)
             with open(filename, 'wb') as cache_file:
-                cache_file.write(b'stale-cache')
+                cache_file.write(b'legacy')
 
             with patch.object(s3, 'PRODUCTION_ENV', True), \
                     patch.object(
                         s3.FileStoreS3, 'path',
                         new_callable=PropertyMock, return_value=tmpdir), \
                     patch.object(
-                        s3.FileStoreS3, 'client',
-                        new_callable=PropertyMock, return_value=client), \
+                        s3.FileStoreS3, '_delete_s3_data') as delete_s3_mock:
+                filestore.delete(file_id, 'attachments')
+
+            self.assertTrue(os.path.exists(filename))
+            delete_s3_mock.assert_not_called()
+
+    def test_s3_filestore_delete_removes_uuid_ids(self):
+        filestore = s3.FileStoreS3()
+        file_id = '12345678-1234-1234-1234-123456789abc'
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            filename = os.path.join(
+                tmpdir, 'attachments', file_id[0:2], file_id[2:4], file_id)
+            os.makedirs(os.path.dirname(filename), exist_ok=True)
+            with open(filename, 'wb') as cache_file:
+                cache_file.write(b'current')
+
+            with patch.object(s3, 'PRODUCTION_ENV', True), \
                     patch.object(
-                        s3.FileStoreS3, '_get_s3_data',
-                        return_value=payload) as get_s3_mock:
-                file_id = filestore.set(payload, 'attachments')
+                        s3.FileStoreS3, 'path',
+                        new_callable=PropertyMock, return_value=tmpdir), \
+                    patch.object(
+                        s3.FileStoreS3, '_delete_s3_data') as delete_s3_mock:
+                filestore.delete(file_id, 'attachments')
 
-            with open(filename, 'rb') as cache_file:
-                cached_payload = cache_file.read()
-
-        self.assertEqual(file_id, expected_id)
-        self.assertEqual(cached_payload, payload)
-        self.assertEqual(get_s3_mock.call_count, 1)
-        self.assertEqual(client.put_calls, [])
+            self.assertFalse(os.path.exists(filename))
+            delete_s3_mock.assert_called_once_with('attachments/%s' % file_id)
 
     def test_s3_filestore_ensure_encrypted(self):
         filestore = s3.FileStoreS3()
