@@ -343,7 +343,7 @@ class S3TestCase(ModuleTestCase):
 
         self.assertEqual(len(client.put_calls), 2)
 
-    def test_s3_filestore_delete_keeps_legacy_ids_without_dash(self):
+    def test_s3_filestore_delete_removes_legacy_ids_from_s3(self):
         filestore = s3.FileStoreS3()
         file_id = 'abcd1234'
 
@@ -363,7 +363,7 @@ class S3TestCase(ModuleTestCase):
                 filestore.delete(file_id, 'attachments')
 
             self.assertTrue(os.path.exists(filename))
-            delete_s3_mock.assert_not_called()
+            delete_s3_mock.assert_called_once_with('attachments/%s' % file_id)
 
     def test_s3_filestore_delete_removes_uuid_ids(self):
         filestore = s3.FileStoreS3()
