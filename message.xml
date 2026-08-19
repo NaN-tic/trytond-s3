@@ -1,0 +1,31 @@
+<?xml version="1.0"?>
+<!-- The COPYRIGHT file at the top level of this repository contains the full
+     copyright notices and license terms. -->
+<tryton>
+    <data grouped="1">
+        <record model="ir.message" id="msg_fernet_key_required">
+            <field name="text">You must configure cryptography/fernet_key before saving files in the S3 filestore.</field>
+        </record>
+        <record model="ir.message" id="msg_invalid_clamd_configuration">
+            <field name="text">The s3/clamd setting must be a socket path or host:port.</field>
+        </record>
+        <record model="ir.message" id="msg_clamd_no_response">
+            <field name="text">ClamAV did not return a response.</field>
+        </record>
+        <record model="ir.message" id="msg_antivirus">
+            <field name="text">Antivirus</field>
+        </record>
+        <record model="ir.message" id="msg_clamd_unavailable">
+            <field name="text">The antivirus could not process the file.</field>
+        </record>
+        <record model="ir.message" id="msg_clamd_malware">
+            <field name="text">The antivirus has detected a problem with this file: %(response)s</field>
+        </record>
+        <record model="ir.message" id="msg_clamd_invalid_version_response">
+            <field name="text">Unexpected ClamAV VERSION response: %(response)s</field>
+        </record>
+        <record model="ir.message" id="msg_clamd_invalid_scan_response">
+            <field name="text">Unexpected ClamAV scan response: %(response)s</field>
+        </record>
+    </data>
+</tryton>

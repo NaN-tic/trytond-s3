@@ -3,6 +3,14 @@
      copyright notices and license terms. -->
 <tryton>
     <data>
+        <record model="res.group" id="group_clamav_malware_warning">
+            <field name="name">Antivirus Malware Warning</field>
+        </record>
+        <record model="res.user-res.group"
+                id="user_admin_group_clamav_malware_warning">
+            <field name="user" ref="res.user_admin"/>
+            <field name="group" ref="group_clamav_malware_warning"/>
+        </record>
         <record model="ir.cron" id="cron_sync_s3_filestore_cache">
             <field name="interval_number" eval="1"/>
             <field name="interval_type">hours</field>
