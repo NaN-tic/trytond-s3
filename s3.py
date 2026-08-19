@@ -1,11 +1,15 @@
 # The COPYRIGHT file at the top level of this repository contains the full
 # copyright notices and license terms.
 import gzip
+import hashlib
 import logging
 import os
 import queue
+import socket
 import threading
 import time
+from datetime import timezone
+from email.utils import parsedate_to_datetime
 from functools import cache
 from io import BytesIO
 from urllib.parse import urlparse
@@ -15,9 +19,10 @@ from minio import Minio
 from minio.error import S3Error
 
 from trytond.config import config
-from trytond.exceptions import UserError
+from trytond.exceptions import UserError, UserWarning
 from trytond.filestore import FileStore
-from trytond.pool import PoolMeta
+from trytond.i18n import gettext
+from trytond.pool import Pool, PoolMeta
 from trytond.transaction import Transaction
 
 logger = logging.getLogger(__name__)
@@ -34,6 +39,10 @@ max_file_life_cache = config.getint(
 max_file_life_count = config.getint(
     'database', 'max_file_life_count', default=-1)
 s3_workers = config.getint('database', 's3_workers', default=50)
+clamd = config.get('s3', 'clamd', default=None)
+clamd_timeout = config.getint('s3', 'clamd_timeout', default=30)
+clamav_version_cache_seconds = 60 * 60
+cache_time_update_interval = 5 * 60
 
 
 def get_default_storage_class():
@@ -75,8 +84,7 @@ def encrypt(data):
     if not fernet:
         if PRODUCTION_ENV:
             raise UserError(
-                'You must configure cryptography/fernet_key before saving '
-                'files in the S3 filestore.')
+                gettext('s3.msg_fernet_key_required'))
         return data
     return fernet.encrypt(bytes(data))
 
@@ -133,6 +141,177 @@ def is_not_found_error(exception):
     response = getattr(exception, 'response', {})
     error = response.get('Error', {})
     return error.get('Code') in {'404', 'NoSuchKey', 'NotFound'}
+
+
+class ClamAV:
+
+    def __init__(self, address, timeout):
+        self.address = address
+        self.timeout = timeout
+        self._database_date = None
+        self._database_date_at = 0
+        self._database_date_lock = threading.Lock()
+
+    @property
+    def enabled(self):
+        return bool(self.address)
+
+    def _connection(self):
+        if os.path.isabs(self.address):
+            connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            connection.settimeout(self.timeout)
+            connection.connect(self.address)
+            return connection
+        address = urlparse('//%s' % self.address)
+        try:
+            host, port = address.hostname, address.port
+        except ValueError:
+            host, port = None, None
+        if not host or port is None:
+            raise UserError(gettext('s3.msg_invalid_clamd_configuration'))
+        return socket.create_connection((host, port), timeout=self.timeout)
+
+    @staticmethod
+    def _response(connection):
+        response = bytearray()
+        while True:
+            chunk = connection.recv(4096)
+            if not chunk:
+                break
+            response.extend(chunk)
+            if b'\0' in chunk:
+                break
+        if not response:
+            raise UserError(gettext('s3.msg_clamd_no_response'))
+        return bytes(response).rstrip(b'\0').decode('utf-8', 'replace')
+
+    @staticmethod
+    def _notify(title, body):
+        # Import notify here to avoid circular import issues when trytond.bus
+        # imports this module.
+        from trytond.bus import notify
+
+        try:
+            notify(title, body, priority=2)
+        except Exception:
+            logger.exception('Could not send ClamAV notification')
+
+    @classmethod
+    def _notify_unavailable(cls, exception):
+        logger.warning('ClamAV could not process file: %s', exception)
+        cls._notify(
+            gettext('s3.msg_antivirus'),
+            gettext('s3.msg_clamd_unavailable'))
+
+    @staticmethod
+    def _warn_on_malware(data, response, readonly):
+        pool = Pool()
+        ModelData = pool.get('ir.model.data')
+        User = pool.get('res.user')
+        group_id = ModelData.get_id('s3', 'group_clamav_malware_warning')
+        if group_id not in User.get_groups():
+            return False
+        message = gettext('s3.msg_clamd_malware', response=response)
+        if readonly:
+            ClamAV._notify(
+                gettext('s3.msg_antivirus'), message)
+            return True
+        key = 's3.clamav_malware.%s' % hashlib.sha256(data).hexdigest()
+        Warning = pool.get('res.user.warning')
+        if Warning.check(key):
+            raise UserWarning(key, message)
+        ClamAV._notify(gettext('s3.msg_antivirus'), message)
+        return True
+
+    def _version(self):
+        try:
+            with self._connection() as connection:
+                connection.sendall(b'zVERSION\0')
+                response = self._response(connection)
+        except OSError as exception:
+            self._notify_unavailable(exception)
+            return None
+        try:
+            database_date = parsedate_to_datetime(response.rsplit('/', 1)[1])
+            if database_date.tzinfo is None:
+                database_date = database_date.replace(tzinfo=timezone.utc)
+            return database_date
+        except (IndexError, TypeError, ValueError):
+            raise UserError(gettext(
+                    's3.msg_clamd_invalid_version_response',
+                    response=response))
+
+    def database_date(self):
+        now = time.monotonic()
+        with self._database_date_lock:
+            if (self._database_date is None
+                    or now - self._database_date_at
+                    >= clamav_version_cache_seconds):
+                self._database_date = self._version()
+                self._database_date_at = now
+            return self._database_date
+
+    def clear_database_date_cache(self):
+        with self._database_date_lock:
+            self._database_date = None
+            self._database_date_at = 0
+
+    def scan(self, data, readonly=False):
+        if not self.enabled:
+            return False
+        try:
+            with self._connection() as connection:
+                connection.sendall(b'zINSTREAM\0')
+                for start in range(0, len(data), 1024 * 1024):
+                    chunk = data[start:start + 1024 * 1024]
+                    connection.sendall(len(chunk).to_bytes(4, 'big') + chunk)
+                connection.sendall(b'\0\0\0\0')
+                response = self._response(connection)
+        except OSError as exception:
+            self._notify_unavailable(exception)
+            return False
+        if response.endswith(': OK'):
+            return True
+        if response.endswith(' FOUND'):
+            if self._warn_on_malware(data, response, readonly):
+                return False
+            raise UserError(gettext('s3.msg_clamd_malware', response=response))
+        raise UserError(gettext(
+                's3.msg_clamd_invalid_scan_response', response=response))
+
+
+clamav = ClamAV(clamd, clamd_timeout)
+
+
+def get_cache_time(filename):
+    return os.path.getatime(filename)
+
+
+def get_scan_time(filename):
+    return os.path.getmtime(filename)
+
+
+def update_cache_time(filename):
+    # Filesystems commonly use relatime/noatime, so update it ourselves.
+    cache_time = get_cache_time(filename)
+    now = time.time()
+    # Avoid frequent metadata writes on copy-on-write filesystems.
+    if now - cache_time >= cache_time_update_interval:
+        os.utime(filename, (now, get_scan_time(filename)))
+
+
+def update_scan_time(filename):
+    # Cache time tracks cache use; scan time tracks successful scans.
+    now = time.time()
+    os.utime(filename, (now, now))
+
+
+def clear_scan_time(filename):
+    os.utime(filename, (get_cache_time(filename), 0))
+
+
+def cache_is_scanned(filename, database_date):
+    return get_scan_time(filename) >= database_date.timestamp()
 
 
 class ProcessClock:
@@ -226,23 +405,24 @@ class FileStoreS3(FileStore):
                 for filename in filenames:
                     path = os.path.join(root, filename)
                     try:
-                        mtime = os.path.getmtime(path)
+                        cache_time = get_cache_time(path)
                     except OSError:
                         continue
-                    cache_files.append((path, mtime))
+                    cache_files.append((path, cache_time))
 
         removed = []
         now = time.time()
         remaining = []
-        for path, mtime in cache_files:
-            if max_file_life_cache >= 0 and now - mtime > max_file_life_cache:
+        for path, cache_time in cache_files:
+            if (max_file_life_cache >= 0
+                    and now - cache_time > max_file_life_cache):
                 try:
                     os.remove(path)
                 except OSError:
                     continue
                 removed.append(path)
             else:
-                remaining.append((path, mtime))
+                remaining.append((path, cache_time))
 
         if max_file_life_count >= 0 and len(remaining) > max_file_life_count:
             to_remove_count = len(remaining) - max_file_life_count
@@ -260,7 +440,13 @@ class FileStoreS3(FileStore):
         filename = self._filename(file_id, prefix)
         cache_file = check_cache(filename)
         if cache_file is not None:
-            os.utime(filename, None)
+            if clamav.enabled:
+                database_date = clamav.database_date()
+                if (database_date
+                        and not cache_is_scanned(filename, database_date)):
+                    if clamav.scan(cache_file, readonly=True):
+                        update_scan_time(filename)
+            update_cache_time(filename)
 
             if PRODUCTION_ENV:
                 removed_files = self.prune_cache_files()
@@ -273,7 +459,12 @@ class FileStoreS3(FileStore):
             return cache_file
 
         data = self._get_s3_data(file_id, prefix)
+        scanned = clamav.scan(data, readonly=True)
         save_cache(data, filename)
+        if scanned:
+            update_scan_time(filename)
+        else:
+            clear_scan_time(filename)
         return data
 
     def size(self, file_id, prefix=''):
@@ -284,7 +475,10 @@ class FileStoreS3(FileStore):
         return self._stat_s3_data(key).size
 
     def set(self, data, prefix=''):
+        scanned = clamav.scan(data, readonly=False)
         file_id = super().set(data, prefix)
+        if not scanned:
+            clear_scan_time(self._filename(file_id, prefix))
         if not PRODUCTION_ENV:
             return file_id
         try:
@@ -480,8 +674,11 @@ class FileStoreS3(FileStore):
         self._delete_s3_data(key)
 
     def set_with_id(self, file_id, data, prefix=''):
+        scanned = clamav.scan(data, readonly=False)
         filename = self._filename(file_id, prefix)
         save_cache(data, filename)
+        if not scanned:
+            clear_scan_time(filename)
         if not PRODUCTION_ENV:
             return file_id
         key = name(file_id, prefix)

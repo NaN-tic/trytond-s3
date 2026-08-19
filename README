@@ -8,6 +8,28 @@ Installing
 
 See INSTALL
 
+ClamAV
+------
+
+Set ``clamd`` in the ``[s3]`` section to the Unix socket of clamd, or to its
+``host:port`` address. For example::
+
+    [s3]
+    clamd = /run/clamav/clamd.ctl
+    # clamd = 127.0.0.1:3310
+
+``clamd_timeout`` defaults to 30 seconds.
+If ``clamd`` is not set, ClamAV scanning is disabled.
+If clamd is unavailable or times out, the user receives a notification and
+the file operation continues without an antivirus result.
+
+The local cache access time is updated at most once every five minutes per
+file to reduce filesystem metadata writes.
+
+Users in the ``Antivirus Malware Warning`` group receive a warning when
+malware is found. After confirming it, they may repeat the operation; other
+users receive an error and cannot continue.
+
 
 License
 -------

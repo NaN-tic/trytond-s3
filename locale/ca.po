@@ -1,0 +1,7 @@
+#
+msgid ""
+msgstr "Content-Type: text/plain; charset=utf-8\n"
+
+msgctxt "model:ir.message,text:msg_clamd_malware"
+msgid "The antivirus has detected a problem with this file: %(response)s"
+msgstr "L'antivirus ha detectat un problema amb aquest fitxer: %(response)s"

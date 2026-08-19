@@ -5,7 +5,7 @@ import os
 import tempfile
 import threading
 from types import SimpleNamespace
-from unittest.mock import PropertyMock, patch
+from unittest.mock import Mock, PropertyMock, patch
 
 from cryptography.fernet import Fernet
 
@@ -44,9 +44,40 @@ class FakeListedObject:
         self.object_name = object_name
 
 
+class FakeClamdConnection:
+
+    def __init__(self, response):
+        self.response = response
+        self.sent = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return None
+
+    def sendall(self, data):
+        self.sent.append(data)
+
+    def recv(self, size):
+        response, self.response = self.response, b''
+        return response
+
+
 class S3TestCase(ModuleTestCase):
     'Test S3 module'
     module = 's3'
+
+    def setUp(self):
+        super().setUp()
+        self.scan_patcher = patch.object(s3.clamav, 'scan')
+        self.scan = self.scan_patcher.start()
+        self.clamav_database_date_patcher = patch.object(
+            s3.clamav, 'database_date', return_value=datetime.datetime(
+                2024, 1, 1, tzinfo=datetime.timezone.utc))
+        self.clamav_database_date = self.clamav_database_date_patcher.start()
+        self.addCleanup(self.scan_patcher.stop)
+        self.addCleanup(self.clamav_database_date_patcher.stop)
 
     def _create_sync_cron(self, Cron):
         cron = Cron(
@@ -83,6 +114,15 @@ class S3TestCase(ModuleTestCase):
             target = os.path.join(tmpdir, 'ab', 'cd', 'file')
             s3.save_cache(payload, target)
             self.assertEqual(s3.check_cache(target), payload)
+            with patch.object(s3.time, 'time', return_value=10):
+                s3.update_scan_time(target)
+            with patch.object(s3.time, 'time', return_value=20):
+                s3.update_cache_time(target)
+            self.assertEqual(s3.get_scan_time(target), 10)
+            self.assertEqual(s3.get_cache_time(target), 10)
+            with patch.object(s3.time, 'time', return_value=310):
+                s3.update_cache_time(target)
+            self.assertEqual(s3.get_cache_time(target), 310)
 
             filestore = s3.FileStoreS3()
             cache_dir = os.path.join(tmpdir, 'cache')
@@ -105,6 +145,182 @@ class S3TestCase(ModuleTestCase):
             self.assertEqual(removed, [old_path])
             self.assertFalse(os.path.exists(old_path))
             self.assertTrue(os.path.exists(new_path))
+
+    def test_clamav_database_date_is_cached_for_an_hour(self):
+        self.clamav_database_date_patcher.stop()
+        connections = [
+            FakeClamdConnection(
+                b'ClamAV 1.4.2/27341/Mon Aug 18 10:20:30 2025\0'),
+            FakeClamdConnection(
+                b'ClamAV 1.4.2/27341/Mon Aug 18 10:20:30 2025\0'),
+            ]
+        s3.clamav.clear_database_date_cache()
+        with patch.object(s3.clamav, '_connection', side_effect=connections), \
+                patch.object(s3.time, 'monotonic', side_effect=[1, 2, 3601]):
+            first = s3.clamav.database_date()
+            second = s3.clamav.database_date()
+            third = s3.clamav.database_date()
+        self.assertEqual(first, datetime.datetime(
+                2025, 8, 18, 10, 20, 30, tzinfo=datetime.timezone.utc))
+        self.assertEqual(second, first)
+        self.assertEqual(third, first)
+        self.assertEqual(
+            [connection.sent for connection in connections],
+            [[b'zVERSION\0'], [b'zVERSION\0']])
+
+    def test_clamav_scan_uses_instream_protocol(self):
+        self.scan_patcher.stop()
+        connection = FakeClamdConnection(b'stream: OK\0')
+        with patch.object(s3.clamav, 'address', '127.0.0.1:3310'), \
+                patch.object(s3.clamav, '_connection', return_value=connection):
+            s3.clamav.scan(b'payload')
+        self.assertEqual(connection.sent, [
+                b'zINSTREAM\0', b'\0\0\0\x07payload', b'\0\0\0\0'])
+
+    def test_clamav_timeout_notifies_without_blocking(self):
+        self.scan_patcher.stop()
+        timeout = TimeoutError('timed out')
+        with patch.object(s3.clamav, 'address', '127.0.0.1:3310'), \
+                patch.object(
+                    s3.clamav, '_connection', side_effect=timeout), \
+                patch.object(
+                    s3, 'gettext', side_effect=lambda message: {
+                        's3.msg_antivirus': 'Antivirus',
+                        's3.msg_clamd_unavailable':
+                            'The antivirus could not process the file.',
+                        }[message]), \
+                patch('trytond.bus.notify') as notify:
+            self.assertFalse(s3.clamav.scan(b'payload'))
+        notify.assert_called_once_with(
+            'Antivirus',
+            'The antivirus could not process the file.',
+            priority=2)
+
+    def test_clamav_malware_is_warning_for_group_member(self):
+        self.scan_patcher.stop()
+        model_data = Mock()
+        model_data.get_id.return_value = 1
+        user = Mock()
+        user.get_groups.return_value = (1,)
+        warning = Mock()
+        warning.check.return_value = True
+        pool = Mock()
+        pool.get.side_effect = {
+            'ir.model.data': model_data,
+            'res.user': user,
+            'res.user.warning': warning,
+            }.get
+        connection = FakeClamdConnection(b'stream: Eicar-Test FOUND\0')
+        with patch.object(s3.clamav, 'address', '127.0.0.1:3310'), \
+                patch.object(s3, 'Pool', return_value=pool), \
+                patch.object(s3.clamav, '_connection', return_value=connection):
+            with self.assertRaises(s3.UserWarning):
+                s3.clamav.scan(b'payload')
+        warning.check.assert_called_once()
+
+    def test_clamav_malware_is_error_for_non_group_member(self):
+        self.scan_patcher.stop()
+        model_data = Mock()
+        model_data.get_id.return_value = 1
+        user = Mock()
+        user.get_groups.return_value = ()
+        pool = Mock()
+        pool.get.side_effect = {
+            'ir.model.data': model_data,
+            'res.user': user,
+            }.get
+        connection = FakeClamdConnection(b'stream: Eicar-Test FOUND\0')
+        with patch.object(s3.clamav, 'address', '127.0.0.1:3310'), \
+                patch.object(s3, 'Pool', return_value=pool), \
+                patch.object(s3.clamav, '_connection', return_value=connection):
+            with self.assertRaises(UserError):
+                s3.clamav.scan(b'payload')
+
+    def test_clamav_malware_notifies_group_member_readonly(self):
+        self.scan_patcher.stop()
+        model_data = Mock()
+        model_data.get_id.return_value = 1
+        user = Mock()
+        user.get_groups.return_value = (1,)
+        pool = Mock()
+        pool.get.side_effect = {
+            'ir.model.data': model_data,
+            'res.user': user,
+            }.get
+        connection = FakeClamdConnection(b'stream: Eicar-Test FOUND\0')
+        with patch.object(s3.clamav, 'address', '127.0.0.1:3310'), \
+                patch.object(s3, 'Pool', return_value=pool), \
+                patch.object(
+                    s3, 'gettext', side_effect=lambda message, **kwargs: message), \
+                patch.object(s3.clamav, '_connection', return_value=connection), \
+                patch('trytond.bus.notify') as notify:
+            self.assertFalse(s3.clamav.scan(b'payload', readonly=True))
+        notify.assert_called_once_with(
+            's3.msg_antivirus', 's3.msg_clamd_malware', priority=2)
+
+    def test_clamav_malware_notifies_group_member_after_warning(self):
+        self.scan_patcher.stop()
+        model_data = Mock()
+        model_data.get_id.return_value = 1
+        user = Mock()
+        user.get_groups.return_value = (1,)
+        warning = Mock()
+        warning.check.return_value = False
+        pool = Mock()
+        pool.get.side_effect = {
+            'ir.model.data': model_data,
+            'res.user': user,
+            'res.user.warning': warning,
+            }.get
+        connection = FakeClamdConnection(b'stream: Eicar-Test FOUND\0')
+        with patch.object(s3.clamav, 'address', '127.0.0.1:3310'), \
+                patch.object(s3, 'Pool', return_value=pool), \
+                patch.object(
+                    s3, 'gettext', side_effect=lambda message, **kwargs: message), \
+                patch.object(s3.clamav, '_connection', return_value=connection), \
+                patch('trytond.bus.notify') as notify:
+            self.assertFalse(s3.clamav.scan(b'payload'))
+        notify.assert_called_once_with(
+            's3.msg_antivirus', 's3.msg_clamd_malware', priority=2)
+
+    def test_clamav_is_skipped_without_configuration(self):
+        filestore = s3.FileStoreS3()
+        file_id = 'abcd1234'
+        with tempfile.TemporaryDirectory() as tmpdir:
+            filename = os.path.join(
+                tmpdir, 'attachments', file_id[0:2], file_id[2:4], file_id)
+            s3.save_cache(b'cached', filename)
+            with patch.object(s3.clamav, 'address', None), \
+                    patch.object(
+                        s3.FileStoreS3, 'path',
+                        new_callable=PropertyMock, return_value=tmpdir), \
+                    patch.object(
+                        s3.clamav, 'database_date') as database_date:
+                self.assertEqual(
+                    filestore.get(file_id, 'attachments'), b'cached')
+        database_date.assert_not_called()
+
+    def test_s3_filestore_get_rescans_outdated_cache(self):
+        filestore = s3.FileStoreS3()
+        file_id = 'abcd1234'
+        database_date = datetime.datetime(
+            2025, 1, 1, tzinfo=datetime.timezone.utc)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            filename = os.path.join(
+                tmpdir, 'attachments', file_id[0:2], file_id[2:4], file_id)
+            s3.save_cache(b'cached', filename)
+            old_timestamp = database_date.timestamp() - 1
+            os.utime(filename, (old_timestamp, old_timestamp))
+            with patch.object(s3.clamav, 'address', '127.0.0.1:3310'), \
+                    patch.object(
+                    s3.FileStoreS3, 'path',
+                    new_callable=PropertyMock, return_value=tmpdir), \
+                    patch.object(
+                        s3.clamav, 'database_date',
+                        return_value=database_date):
+                self.assertEqual(
+                    filestore.get(file_id, 'attachments'), b'cached')
+        self.scan.assert_called_once_with(b'cached', readonly=True)
 
     def test_s3_filestore_prune_cache_files_removes_by_count(self):
         filestore = s3.FileStoreS3()
