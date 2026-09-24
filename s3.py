@@ -209,7 +209,8 @@ class ClamAV:
         ModelData = pool.get('ir.model.data')
         User = pool.get('res.user')
         group_id = ModelData.get_id('s3', 'group_clamav_malware_warning')
-        if group_id not in User.get_groups():
+        if (group_id not in User.get_groups()
+                and not User.is_administrator()):
             return False
         message = gettext('s3.msg_clamd_malware', response=response)
         if readonly:
