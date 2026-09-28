@@ -17,6 +17,7 @@ from urllib.parse import urlparse
 from cryptography.fernet import Fernet, InvalidToken
 from minio import Minio
 from minio.error import S3Error
+from minio.helpers import check_bucket_name
 
 from trytond.config import config
 from trytond.exceptions import UserError, UserWarning
@@ -372,12 +373,20 @@ class FileStoreS3(FileStore):
                 parsed = urlparse(client_endpoint)
                 secure = parsed.scheme == 'https'
                 client_endpoint = parsed.netloc or parsed.path
-            FileStoreS3._client = Minio(
-                client_endpoint,
-                access_key=access_key,
-                secret_key=secret_key,
-                secure=secure,
-                )
+            try:
+                check_bucket_name(bucket)
+                client = Minio(
+                    client_endpoint,
+                    access_key=access_key,
+                    secret_key=secret_key,
+                    secure=secure,
+                    )
+            except (TypeError, ValueError) as exception:
+                error = str(exception) or exception.__class__.__name__
+                raise UserError(gettext(
+                        's3.msg_invalid_configuration',
+                        error=error)) from exception
+            FileStoreS3._client = client
         return FileStoreS3._client
 
     def _put_s3_data(self, key, data):
@@ -501,6 +510,8 @@ class FileStoreS3(FileStore):
                 'encrypted': 0,
                 'skipped': 0,
             }
+        # Validate the configuration before starting worker threads.
+        self.client
         process_clock = ProcessClock()
         task_queue = queue.Queue(maxsize=max(s3_workers * 2, 1))
         stop_event = threading.Event()
@@ -590,6 +601,8 @@ class FileStoreS3(FileStore):
                 'uploaded': 0,
                 'skipped': 0,
             }
+        # Validate the configuration before starting worker threads.
+        self.client
         process_clock = ProcessClock()
         task_queue = queue.Queue(maxsize=max(s3_workers * 2, 1))
         stop_event = threading.Event()
