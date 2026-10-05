@@ -224,6 +224,7 @@ class S3TestCase(ModuleTestCase):
         model_data.get_id.return_value = 1
         user = Mock()
         user.get_groups.return_value = ()
+        user.is_administrator.return_value = False
         pool = Mock()
         pool.get.side_effect = {
             'ir.model.data': model_data,
