@@ -1,0 +1,58 @@
+#
+msgid ""
+msgstr ""
+"Language: zh_CN\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=utf-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Plural-Forms: nplurals=1; plural=0;\n"
+
+#, python-format
+msgctxt "model:ir.message,text:msg_clamd_malware"
+msgid "The antivirus has detected a problem with this file: %(response)s"
+msgstr "杀毒软件检测到此文件存在问题：%(response)s"
+
+#, python-format
+msgctxt "model:ir.message,text:msg_invalid_configuration"
+msgid "The S3 configuration is invalid: %(error)s"
+msgstr "S3 配置无效：%(error)s"
+
+msgctxt "model:ir.message,text:msg_fernet_key_required"
+msgid ""
+"You must configure cryptography/fernet_key before saving files in the S3 "
+"filestore."
+msgstr "在 S3 文件存储中保存文件之前，必须配置 cryptography/fernet_key。"
+
+msgctxt "model:ir.message,text:msg_invalid_clamd_configuration"
+msgid "The s3/clamd setting must be a socket path or host:port."
+msgstr "s3/clamd 设置必须为套接字路径或 host:port。"
+
+msgctxt "model:ir.message,text:msg_clamd_no_response"
+msgid "ClamAV did not return a response."
+msgstr "ClamAV 未返回响应。"
+
+msgctxt "model:ir.message,text:msg_antivirus"
+msgid "Antivirus"
+msgstr "杀毒软件"
+
+msgctxt "model:ir.message,text:msg_clamd_unavailable"
+msgid "The antivirus could not process the file."
+msgstr "杀毒软件无法处理此文件。"
+
+#, python-format
+msgctxt "model:ir.message,text:msg_clamd_invalid_version_response"
+msgid "Unexpected ClamAV VERSION response: %(response)s"
+msgstr "意外的 ClamAV VERSION 响应：%(response)s"
+
+#, python-format
+msgctxt "model:ir.message,text:msg_clamd_invalid_scan_response"
+msgid "Unexpected ClamAV scan response: %(response)s"
+msgstr "意外的 ClamAV 扫描响应：%(response)s"
+
+msgctxt "model:res.group,name:group_clamav_malware_warning"
+msgid "Antivirus Malware Warning"
+msgstr "杀毒软件恶意软件警告"
+
+msgctxt "selection:ir.cron,method:"
+msgid "S3 - Synchronize Cache"
+msgstr "S3 - 同步缓存"
