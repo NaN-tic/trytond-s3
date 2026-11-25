@@ -1,0 +1,60 @@
+#
+msgid ""
+msgstr ""
+"Language: km\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=utf-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Plural-Forms: nplurals=1; plural=0;\n"
+
+#, python-format
+msgctxt "model:ir.message,text:msg_clamd_malware"
+msgid "The antivirus has detected a problem with this file: %(response)s"
+msgstr "កម្មវិធីប្រឆាំងមេរោគរកឃើញបញ្ហាក្នុងឯកសារនេះ៖ %(response)s"
+
+#, python-format
+msgctxt "model:ir.message,text:msg_invalid_configuration"
+msgid "The S3 configuration is invalid: %(error)s"
+msgstr "ការកំណត់ S3 មិនត្រឹមត្រូវ៖ %(error)s"
+
+msgctxt "model:ir.message,text:msg_fernet_key_required"
+msgid ""
+"You must configure cryptography/fernet_key before saving files in the S3 "
+"filestore."
+msgstr ""
+"អ្នកត្រូវកំណត់ cryptography/fernet_key មុននឹងរក្សាទុកឯកសារក្នុងឃ្លាំងឯកសារ "
+"S3។"
+
+msgctxt "model:ir.message,text:msg_invalid_clamd_configuration"
+msgid "The s3/clamd setting must be a socket path or host:port."
+msgstr "ការកំណត់ s3/clamd ត្រូវតែជាផ្លូវ socket ឬ host:port។"
+
+msgctxt "model:ir.message,text:msg_clamd_no_response"
+msgid "ClamAV did not return a response."
+msgstr "ClamAV មិនបានផ្ដល់ចម្លើយទេ។"
+
+msgctxt "model:ir.message,text:msg_antivirus"
+msgid "Antivirus"
+msgstr "កម្មវិធីប្រឆាំងមេរោគ"
+
+msgctxt "model:ir.message,text:msg_clamd_unavailable"
+msgid "The antivirus could not process the file."
+msgstr "កម្មវិធីប្រឆាំងមេរោគមិនអាចដំណើរការឯកសារបានទេ។"
+
+#, python-format
+msgctxt "model:ir.message,text:msg_clamd_invalid_version_response"
+msgid "Unexpected ClamAV VERSION response: %(response)s"
+msgstr "ចម្លើយ ClamAV VERSION មិនដូចការរំពឹងទុក៖ %(response)s"
+
+#, python-format
+msgctxt "model:ir.message,text:msg_clamd_invalid_scan_response"
+msgid "Unexpected ClamAV scan response: %(response)s"
+msgstr "ចម្លើយស្កេន ClamAV មិនដូចការរំពឹងទុក៖ %(response)s"
+
+msgctxt "model:res.group,name:group_clamav_malware_warning"
+msgid "Antivirus Malware Warning"
+msgstr "ការព្រមានមេរោគពីកម្មវិធីប្រឆាំងមេរោគ"
+
+msgctxt "selection:ir.cron,method:"
+msgid "S3 - Synchronize Cache"
+msgstr "S3 - ធ្វើសមកាលកម្មឃ្លាំងបណ្ដោះអាសន្ន"
